@@ -29,7 +29,12 @@ SYMBOLS = [
     "RELIANCE", "TCS", "INFOSYS", "HDFC BANK", "ICICI BANK", "SBIN", "ITC", "BHARTI AIRTEL",
     "BTC/USDT", "ETH/USDT",
 ]
-AUTH_DB = Path(os.environ.get("TRADEMIND_AUTH_DB", Path(__file__).with_name("trademind-auth.sqlite3")))
+DEFAULT_AUTH_DB = (
+    Path("/tmp/trademind-auth.sqlite3")
+    if os.environ.get("VERCEL")
+    else Path(__file__).with_name("trademind-auth.sqlite3")
+)
+AUTH_DB = Path(os.environ.get("TRADEMIND_AUTH_DB", DEFAULT_AUTH_DB))
 PASSWORD_ITERATIONS = 310_000
 SESSION_LIFETIME = timedelta(days=30)
 
@@ -214,6 +219,12 @@ def send_telegram_message(
 @app.get("/")
 def root():
     return {"name": "AI Trading Dashboard API", "status": "online", "market_data": "live when provider is available"}
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "service": "backend"}
+
 
 @app.get("/api/markets")
 def markets():

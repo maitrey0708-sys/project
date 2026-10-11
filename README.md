@@ -49,6 +49,8 @@ npm run dev
 ## Accounts
 Create an account from the login screen before signing in. Usernames and hashed passwords are stored in the backend SQLite database at `backend/trademind-auth.sqlite3` by default. Set `TRADEMIND_AUTH_DB` to choose a persistent database path when deploying; keep that database private and back it up securely. Existing browser-only sessions are not server accounts, so those users need to sign up once.
 
+On Vercel, the backend uses `/tmp/trademind-auth.sqlite3` so the FastAPI service can start on its read-only deployment filesystem. Vercel's temporary filesystem is not durable or shared between function instances, so use a persistent external database before relying on account storage in production. Check backend availability at `/api/health`.
+
 ## Telegram signal alerts
 After signing in, open the profile settings and enter a Telegram bot token and chat ID, then use **Test Telegram connection** to confirm delivery. Create the bot with Telegram's BotFather and send it `/start` from the target chat before testing; a bot cannot start a private chat on its own. Signal alerts are sent by the backend through the Telegram Bot API when the selected signal changes. Keep the dashboard open and signed in to receive automatic alerts. Telegram settings are stored in this browser, so only save a bot token on a device you trust.
 
