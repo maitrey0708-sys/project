@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -14,6 +15,8 @@ from urllib.request import Request, urlopen
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+import psycopg
+from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
 from ml_engine import generate_signal
@@ -29,12 +32,13 @@ SYMBOLS = [
     "RELIANCE", "TCS", "INFOSYS", "HDFC BANK", "ICICI BANK", "SBIN", "ITC", "BHARTI AIRTEL",
     "BTC/USDT", "ETH/USDT",
 ]
-DEFAULT_AUTH_DB = (
-    Path("/tmp/trademind-auth.sqlite3")
-    if os.environ.get("VERCEL")
-    else Path(__file__).with_name("trademind-auth.sqlite3")
-)
+DEFAULT_AUTH_DB = Path(__file__).with_name("trademind-auth.sqlite3")
 AUTH_DB = Path(os.environ.get("TRADEMIND_AUTH_DB", DEFAULT_AUTH_DB))
+DATABASE_URL = (
+    os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL")
+    or os.environ.get("POSTGRES_URL_NON_POOLING")
+)
 PASSWORD_ITERATIONS = 310_000
 SESSION_LIFETIME = timedelta(days=30)
 
@@ -50,35 +54,88 @@ class TelegramMessage(BaseModel):
     message: str = Field(min_length=1, max_length=4096)
 
 
+@contextmanager
 def _auth_connection():
+    if DATABASE_URL:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=5) as connection:
+            yield connection
+        return
+    if os.environ.get("VERCEL"):
+        raise HTTPException(
+            status_code=503,
+            detail="Persistent account storage is not configured. Set DATABASE_URL in the Vercel project environment.",
+        )
+
     AUTH_DB.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(AUTH_DB)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
+def _execute(connection, query, parameters=()):
+    if DATABASE_URL:
+        query = query.replace("?", "%s")
+    return connection.execute(query, parameters)
 
 
 def _initialize_auth_db():
+    if os.environ.get("VERCEL") and not DATABASE_URL:
+        return
     with _auth_connection() as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
-                password_salt BLOB NOT NULL,
-                password_hash BLOB NOT NULL,
-                created_at TEXT NOT NULL
+        if DATABASE_URL:
+            _execute(
+                connection,
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    password_salt BYTEA NOT NULL,
+                    password_hash BYTEA NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """,
             )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS auth_sessions (
-                token_hash TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                expires_at TEXT NOT NULL
+            _execute(
+                connection,
+                """
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    expires_at TEXT NOT NULL
+                )
+                """,
             )
-            """
+        else:
+            _execute(
+                connection,
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_salt BLOB NOT NULL,
+                    password_hash BLOB NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """,
+            )
+            _execute(
+                connection,
+                """
+                CREATE TABLE IF NOT EXISTS auth_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    expires_at TEXT NOT NULL
+                )
+                """,
+            )
+        _execute(
+            connection,
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx ON users (LOWER(username))",
         )
 
 
@@ -89,11 +146,12 @@ def _hash_password(password: str, salt: bytes) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
 
 
-def _new_session(connection: sqlite3.Connection, user_id: int) -> str:
+def _new_session(connection, user_id: int) -> str:
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     expires_at = (datetime.now(timezone.utc) + SESSION_LIFETIME).isoformat()
-    connection.execute(
+    _execute(
+        connection,
         "INSERT INTO auth_sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
         (token_hash, user_id, expires_at),
     )
@@ -115,13 +173,22 @@ def signup(credentials: Credentials):
     password_hash = _hash_password(credentials.password, salt)
     try:
         with _auth_connection() as connection:
-            cursor = connection.execute(
-                "INSERT INTO users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
-                (username, salt, password_hash, datetime.now(timezone.utc).isoformat()),
-            )
-            user_id = int(cursor.lastrowid)
+            if DATABASE_URL:
+                cursor = _execute(
+                    connection,
+                    "INSERT INTO users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?) RETURNING id",
+                    (username, salt, password_hash, datetime.now(timezone.utc).isoformat()),
+                )
+                user_id = int(cursor.fetchone()["id"])
+            else:
+                cursor = _execute(
+                    connection,
+                    "INSERT INTO users (username, password_salt, password_hash, created_at) VALUES (?, ?, ?, ?)",
+                    (username, salt, password_hash, datetime.now(timezone.utc).isoformat()),
+                )
+                user_id = int(cursor.lastrowid)
             token = _new_session(connection, user_id)
-    except sqlite3.IntegrityError as error:
+    except (sqlite3.IntegrityError, psycopg.IntegrityError) as error:
         raise HTTPException(status_code=409, detail="An account with that username already exists. Log in instead.") from error
     return {"access_token": token, "token_type": "bearer", "username": username}
 
@@ -129,8 +196,9 @@ def signup(credentials: Credentials):
 @app.post("/api/auth/login")
 def login(credentials: Credentials):
     with _auth_connection() as connection:
-        user = connection.execute(
-            "SELECT id, username, password_salt, password_hash FROM users WHERE username = ? COLLATE NOCASE",
+        user = _execute(
+            connection,
+            "SELECT id, username, password_salt, password_hash FROM users WHERE LOWER(username) = LOWER(?)",
             (credentials.username.strip(),),
         ).fetchone()
         if user is None or not hmac.compare_digest(
@@ -148,7 +216,8 @@ def current_user(authorization: str | None = Header(default=None)):
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = datetime.now(timezone.utc).isoformat()
     with _auth_connection() as connection:
-        user = connection.execute(
+        user = _execute(
+            connection,
             """
             SELECT users.username, auth_sessions.expires_at
             FROM auth_sessions JOIN users ON users.id = auth_sessions.user_id
@@ -157,7 +226,7 @@ def current_user(authorization: str | None = Header(default=None)):
             (token_hash,),
         ).fetchone()
         if user is None or user["expires_at"] <= now:
-            connection.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+            _execute(connection, "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
             raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
     return {"username": user["username"]}
 
@@ -167,7 +236,7 @@ def logout(authorization: str | None = Header(default=None)):
     token = _session_token(authorization)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with _auth_connection() as connection:
-        connection.execute("DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
+        _execute(connection, "DELETE FROM auth_sessions WHERE token_hash = ?", (token_hash,))
     return None
 
 
@@ -223,7 +292,30 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "backend"}
+    if os.environ.get("VERCEL") and not DATABASE_URL:
+        return {
+            "status": "ok",
+            "service": "backend",
+            "database": "not_configured",
+            "persistent_storage": False,
+        }
+    database_status = "postgresql" if DATABASE_URL else "sqlite"
+    try:
+        with _auth_connection() as connection:
+            _execute(connection, "SELECT 1")
+    except psycopg.Error as error:
+        if not DATABASE_URL:
+            raise
+        raise HTTPException(
+            status_code=503,
+            detail="The configured PostgreSQL database is unavailable.",
+        ) from error
+    return {
+        "status": "ok",
+        "service": "backend",
+        "database": database_status,
+        "persistent_storage": bool(DATABASE_URL) or not os.environ.get("VERCEL"),
+    }
 
 
 @app.get("/api/markets")
