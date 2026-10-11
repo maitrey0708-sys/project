@@ -1,5 +1,5 @@
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import numpy as np
 import pandas as pd
 
@@ -26,9 +26,69 @@ SYMBOL_MAP = {
 
 _cache = {}
 CACHE_SECONDS = 15
+TIMEFRAME_HISTORY = {
+    "1m": "7d",
+    "2m": "60d",
+    "5m": "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "60m": "60d",
+    "90m": "60d",
+    "1h": "60d",
+    "1d": "5y",
+    "5d": "5y",
+    "1wk": "10y",
+    "1mo": "10y",
+    "3mo": "10y",
+}
+TIMEFRAME_FREQUENCY = {
+    "1m": "min",
+    "2m": "2min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "60m": "h",
+    "90m": "90min",
+    "1h": "h",
+    "1d": "D",
+    "5d": "5D",
+    "1wk": "W",
+    "1mo": "MS",
+    "3mo": "QS",
+}
+TIMEFRAME_MAX_DURATION_DAYS = {
+    "1m": 7,
+    "2m": 60,
+    "5m": 60,
+    "15m": 60,
+    "30m": 60,
+    "60m": 60,
+    "90m": 60,
+    "1h": 60,
+    "1d": 1825,
+    "5d": 1825,
+    "1wk": 3650,
+    "1mo": 3650,
+    "3mo": 3650,
+}
 
 
-def _demo_frame(symbol="NIFTY 50", periods=80):
+def _duration_offset(duration, unit):
+    if unit == "months":
+        return pd.DateOffset(months=duration)
+    if unit == "years":
+        return pd.DateOffset(years=duration)
+    return pd.Timedelta(days=duration)
+
+
+def _max_duration(interval, unit):
+    if unit not in {"days", "months", "years"}:
+        raise ValueError(f"Unsupported duration unit: {unit}")
+    divisor = {"days": 1, "months": 30, "years": 365}[unit]
+    return TIMEFRAME_MAX_DURATION_DAYS[interval] // divisor
+
+
+def _demo_frame(symbol="NIFTY 50", periods=80, interval="5m", duration=None, duration_unit="days"):
     bases = {
         "NIFTY 50": 25842.35,
         "BANK NIFTY": 58320.10,
@@ -46,9 +106,16 @@ def _demo_frame(symbol="NIFTY 50", periods=80):
     }
     base = bases.get(symbol, bases["NIFTY 50"])
     rng = np.random.default_rng(abs(hash(symbol)) % (2**32))
+    frequency = TIMEFRAME_FREQUENCY[interval]
+    if duration is None:
+        dates = pd.date_range(end=datetime.now(), periods=periods, freq=frequency)
+    else:
+        end = datetime.now()
+        start = end - _duration_offset(duration, duration_unit)
+        dates = pd.date_range(start=start, end=end, freq=frequency)
+        periods = len(dates)
     returns = rng.normal(0.0004, 0.008, periods)
     close = base * np.cumprod(1 + returns)
-    dates = pd.date_range(datetime.now() - timedelta(hours=periods), periods=periods, freq="h")
     df = pd.DataFrame({"time": dates, "close": close})
     df["open"] = df["close"].shift(1).fillna(df["close"] * 0.998)
     df["high"] = df[["open", "close"]].max(axis=1) * (1 + rng.uniform(0, .003, periods))
@@ -72,8 +139,12 @@ def _add_indicators(df):
     return df
 
 
-def market_frame(symbol="NIFTY 50", periods=80, live=True):
-    key = (symbol, periods)
+def market_frame(symbol="NIFTY 50", periods=80, live=True, interval="5m", duration=None, duration_unit="days"):
+    if interval not in TIMEFRAME_HISTORY:
+        raise ValueError(f"Unsupported market timeframe: {interval}")
+    if duration is not None and not 1 <= duration <= _max_duration(interval, duration_unit):
+        raise ValueError(f"Duration must be between 1 and {_max_duration(interval, duration_unit)} {duration_unit} for {interval}.")
+    key = (symbol, periods, interval, duration, duration_unit)
     now = time.time()
     if live and key in _cache and now - _cache[key][0] < CACHE_SECONDS:
         return _cache[key][1].copy(), True
@@ -82,9 +153,9 @@ def market_frame(symbol="NIFTY 50", periods=80, live=True):
     if live and yf is not None and symbol in SYMBOL_MAP:
         try:
             ticker = yf.Ticker(SYMBOL_MAP[symbol])
-            data = ticker.history(period="5d", interval="5m", auto_adjust=False)
+            data = ticker.history(period=TIMEFRAME_HISTORY[interval], interval=interval, auto_adjust=False)
             if data is not None and not data.empty:
-                data = data.tail(periods).reset_index()
+                data = data.reset_index()
                 time_col = "Datetime" if "Datetime" in data.columns else "Date"
                 df = pd.DataFrame({
                     "time": pd.to_datetime(data[time_col]),
@@ -94,12 +165,19 @@ def market_frame(symbol="NIFTY 50", periods=80, live=True):
                     "close": data["Close"].astype(float),
                     "volume": data["Volume"].astype(float),
                 }).dropna(subset=["close"])
+                if duration is None:
+                    df = df.tail(periods)
         except Exception:
             df = None
 
+    if df is not None and not df.empty and duration is not None:
+        cutoff = pd.Timestamp.now(tz="UTC") - _duration_offset(duration, duration_unit)
+        timestamps = pd.to_datetime(df["time"], utc=True)
+        df = df.loc[timestamps >= cutoff].reset_index(drop=True)
+
     is_live = df is not None and not df.empty
     if not is_live:
-        df = _demo_frame(symbol, periods)
+        df = _demo_frame(symbol, periods, interval, duration, duration_unit)
 
     df = _add_indicators(df)
     _cache[key] = (now, df.copy())

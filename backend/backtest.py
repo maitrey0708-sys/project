@@ -2,25 +2,28 @@ import numpy as np
 
 def run_backtest(df, initial_capital=100000):
     capital = float(initial_capital)
-    equity = [capital]
+    equity = []
     position = 0.0
     wins = 0
     trades = 0
+    entry_price = 0.0
 
-    for i in range(20, len(df)):
+    for i in range(len(df)):
         price = float(df.close.iloc[i])
         sma = float(df.sma20.iloc[i])
-        if price > sma and position == 0:
+        if np.isfinite(sma) and price > sma and position == 0:
             position = capital / price
             capital = 0
-            trades += 1
-        elif price < sma and position > 0:
+            entry_price = price
+        elif np.isfinite(sma) and price < sma and position > 0:
             capital = position * price
             position = 0
             trades += 1
-            wins += 1
+            wins += int(price > entry_price)
         equity.append(capital + position * price)
 
+    if not equity:
+        equity = [float(initial_capital)]
     final_value = equity[-1]
     pnl = final_value - initial_capital
     returns = np.diff(equity) / np.maximum(equity[:-1], 1)
