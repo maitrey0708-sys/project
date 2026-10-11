@@ -106,6 +106,19 @@ function getSignalPlan(symbol, market, signal){
   };
 }
 
+function formatMarketPrice(symbol, value){
+  if (!Number.isFinite(value)) return "—";
+  const isCrypto = ["BTC/USDT", "ETH/USDT"].includes(symbol);
+  return `${isCrypto ? "$" : "₹"}${value.toLocaleString(isCrypto ? "en-US" : "en-IN", {maximumFractionDigits: 2})}`;
+}
+
+function formatSignalMove(entryPrice, currentPrice){
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(currentPrice)) return "unavailable";
+  const points = currentPrice - entryPrice;
+  const percent = points / entryPrice * 100;
+  return `${points >= 0 ? "+" : ""}${points.toFixed(2)} (${percent >= 0 ? "+" : ""}${percent.toFixed(2)}%)`;
+}
+
 function App(){
   const [page, setPage] = useState("Dashboard");
   const [symbol, setSymbol] = useState("NIFTY 50");
@@ -377,8 +390,11 @@ function App(){
     const now = new Date();
     const tradeDate = formatTradeDate(now);
     const localDateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const currentPrice = Number(market.price);
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) return;
+
     const notificationKey = `${symbol}:${localDateKey}:${direction}`;
-    const message = `${symbol}: ${direction} signal on ${tradeDate}. Entry ${plan.entry}, Exit ${plan.exit}, Stop Loss ${plan.stopLoss}. Confidence ${signal.confidence || 0}%.`;
+    const notificationMessage = `${symbol}: ${direction} signal on ${tradeDate}. Entry ${plan.entry}, Exit ${plan.exit}, Stop Loss ${plan.stopLoss}. Confidence ${signal.confidence || 0}%.`;
     if (!notifiedMarketSignalsRef.current.has(notificationKey)) {
       notifiedMarketSignalsRef.current.add(notificationKey);
       try {
@@ -387,22 +403,126 @@ function App(){
           JSON.stringify([...notifiedMarketSignalsRef.current].slice(-100))
         );
       } catch {}
-      addLog(message, "signal");
+      addLog(notificationMessage, "signal");
     }
 
-    if (!["BUY", "SELL"].includes(direction)) return;
-    if (!telegramConfig.botToken || !telegramConfig.chatId) return;
-    const signalKey = `${symbol}:${direction}:${signal.confidence}`;
-    if (
-      lastSignalTelegramKeyRef.current === signalKey ||
-      pendingSignalTelegramKeyRef.current === signalKey
-    ) return;
+    let signalStates = {};
+    let activeTrade = null;
+    const tradeStorageKey = `trademind-market-trade:${symbol}`;
+    try {
+      signalStates = JSON.parse(localStorage.getItem("trademind-market-signal-directions") || "{}");
+      if (!signalStates || typeof signalStates !== "object" || Array.isArray(signalStates)) signalStates = {};
+      activeTrade = JSON.parse(localStorage.getItem(tradeStorageKey) || "null");
+    } catch {}
 
-    pendingSignalTelegramKeyRef.current = signalKey;
-    notifyTelegram(message).then((delivery) => {
-      if (delivery.ok) lastSignalTelegramKeyRef.current = signalKey;
-      if (pendingSignalTelegramKeyRef.current === signalKey) pendingSignalTelegramKeyRef.current = "";
-    });
+    const directionChanged = signalStates[symbol] !== direction;
+    let telegramMessage = "";
+    let telegramKey = "";
+    const signalStatusKey = `${symbol}:${telegramConfig.chatId}:${telegramConfig.botToken.slice(-4)}:${localDateKey}:${direction}`;
+    let deliveredSignalStates = {};
+    try {
+      deliveredSignalStates = JSON.parse(localStorage.getItem("trademind-telegram-signal-state") || "{}");
+      if (!deliveredSignalStates || typeof deliveredSignalStates !== "object" || Array.isArray(deliveredSignalStates)) {
+        deliveredSignalStates = {};
+      }
+    } catch {}
+
+    if (activeTrade?.openedAt && new Date(activeTrade.openedAt).toLocaleDateString("en-CA") !== localDateKey) {
+      activeTrade = null;
+      try { localStorage.removeItem(tradeStorageKey); } catch {}
+    }
+
+    if (directionChanged) {
+      signalStates[symbol] = direction;
+      try {
+        localStorage.setItem("trademind-market-signal-directions", JSON.stringify(signalStates));
+      } catch {}
+
+      if (direction === "BUY" && !activeTrade) {
+        activeTrade = {
+          entryPrice: currentPrice,
+          openedAt: now.toISOString(),
+          targetPrice: currentPrice * 1.022,
+          stopPrice: currentPrice * 0.985,
+          lastProfitMilestone: 0
+        };
+        try { localStorage.setItem(tradeStorageKey, JSON.stringify(activeTrade)); } catch {}
+      }
+
+      if (direction === "BUY") {
+        telegramMessage = `${symbol} · BUY signal · ${tradeDate}\nSignal entry: ${formatMarketPrice(symbol, currentPrice)}\nTarget scenario: ${formatMarketPrice(symbol, activeTrade?.targetPrice || currentPrice * 1.022)}\nStop-loss scenario: ${formatMarketPrice(symbol, activeTrade?.stopPrice || currentPrice * 0.985)}\nConfidence: ${signal.confidence || 0}%\nInformational signal only. No order is placed and prices are not guaranteed.`;
+      } else if (direction === "HOLD") {
+        telegramMessage = activeTrade
+          ? `${symbol} · HOLD existing BUY · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry (${formatMarketPrice(symbol, activeTrade.entryPrice)}): ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade.targetPrice)} · Stop: ${formatMarketPrice(symbol, activeTrade.stopPrice)}\nIndicative signal move only; actual P&L depends on your entry, quantity, and costs.`
+          : `${symbol} · HOLD / WAIT · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nNo active BUY signal is being tracked. Wait for a directional signal; no order was placed.`;
+      } else {
+        telegramMessage = activeTrade
+          ? `${symbol} · SELL / EXIT BUY signal · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry (${formatMarketPrice(symbol, activeTrade.entryPrice)}): ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nIndicative exit signal only; no order was placed.`
+          : `${symbol} · SELL signal · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nBearish signal: consider exiting an existing long or avoiding a new long. No order was placed.`;
+        if (activeTrade) {
+          activeTrade = null;
+          try { localStorage.removeItem(tradeStorageKey); } catch {}
+        }
+      }
+      telegramKey = signalStatusKey;
+    }
+
+    if (activeTrade && ["BUY", "HOLD"].includes(direction)) {
+      const movePercent = (currentPrice / activeTrade.entryPrice - 1) * 100;
+      if (currentPrice >= activeTrade.targetPrice) {
+        telegramMessage = `${symbol} · TARGET REACHED · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry: ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget scenario: ${formatMarketPrice(symbol, activeTrade.targetPrice)}\nConsider reviewing or closing your position. This alert does not place an order.`;
+        telegramKey = `${symbol}:TARGET:${activeTrade.openedAt}`;
+        activeTrade = null;
+        try { localStorage.removeItem(tradeStorageKey); } catch {}
+      } else if (currentPrice <= activeTrade.stopPrice) {
+        telegramMessage = `${symbol} · STOP-LOSS LEVEL REACHED · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry: ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nStop scenario: ${formatMarketPrice(symbol, activeTrade.stopPrice)}\nReview your risk and position. This alert does not place an order.`;
+        telegramKey = `${symbol}:STOP:${activeTrade.openedAt}`;
+        activeTrade = null;
+        try { localStorage.removeItem(tradeStorageKey); } catch {}
+      } else if (movePercent >= 1 && Math.floor(movePercent) > activeTrade.lastProfitMilestone) {
+        activeTrade.lastProfitMilestone = Math.floor(movePercent);
+        telegramMessage = `${symbol} · HOLD · SIGNAL MOVE IS POSITIVE · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry: ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade.targetPrice)} · Stop: ${formatMarketPrice(symbol, activeTrade.stopPrice)}\nIndicative signal move only, not actual account P&L.`;
+        telegramKey = `${symbol}:GAIN:${activeTrade.openedAt}:${activeTrade.lastProfitMilestone}`;
+        try { localStorage.setItem(tradeStorageKey, JSON.stringify(activeTrade)); } catch {}
+      }
+    }
+
+    if (
+      !telegramMessage &&
+      telegramConfig.botToken &&
+      telegramConfig.chatId &&
+      deliveredSignalStates[symbol] !== signalStatusKey
+    ) {
+      telegramMessage = direction === "BUY"
+        ? `${symbol} · BUY signal is active · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nTracked signal entry: ${formatMarketPrice(symbol, activeTrade?.entryPrice || currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade?.targetPrice || currentPrice * 1.022)} · Stop: ${formatMarketPrice(symbol, activeTrade?.stopPrice || currentPrice * 0.985)}\nInformational signal only; no order is placed.`
+        : direction === "HOLD"
+          ? activeTrade
+            ? `${symbol} · HOLD existing BUY · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nMove since signal entry: ${formatSignalMove(activeTrade.entryPrice, currentPrice)}\nTarget: ${formatMarketPrice(symbol, activeTrade.targetPrice)} · Stop: ${formatMarketPrice(symbol, activeTrade.stopPrice)}\nIndicative move only; it is not actual account P&L.`
+            : `${symbol} · HOLD / WAIT · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nNo active BUY signal is being tracked. No order was placed.`
+          : `${symbol} · SELL signal · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nBearish signal: consider exiting an existing long or avoiding a new long. No order was placed.`;
+      telegramKey = signalStatusKey;
+    }
+
+    if (telegramMessage && telegramConfig.botToken && telegramConfig.chatId) {
+      if (
+        lastSignalTelegramKeyRef.current !== telegramKey &&
+        pendingSignalTelegramKeyRef.current !== telegramKey
+      ) {
+        pendingSignalTelegramKeyRef.current = telegramKey;
+        notifyTelegram(telegramMessage).then((delivery) => {
+          if (delivery.ok) {
+            lastSignalTelegramKeyRef.current = telegramKey;
+            if (telegramKey === signalStatusKey) {
+              deliveredSignalStates[symbol] = signalStatusKey;
+              try {
+                localStorage.setItem("trademind-telegram-signal-state", JSON.stringify(deliveredSignalStates));
+              } catch {}
+            }
+          }
+          if (pendingSignalTelegramKeyRef.current === telegramKey) pendingSignalTelegramKeyRef.current = "";
+        });
+      }
+    }
   }, [isLoggedIn, symbol, market, signal, telegramConfig.botToken, telegramConfig.chatId]);
 
   async function runBacktest(customForm = backtestForm){
