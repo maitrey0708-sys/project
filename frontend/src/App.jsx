@@ -208,6 +208,15 @@ function App(){
   const lastSignalTelegramKeyRef = useRef("");
   const pendingSignalTelegramKeyRef = useRef("");
   const notifiedMarketSignalsRef = useRef(null);
+  const loggedTradeAlertsRef = useRef(null);
+  if (loggedTradeAlertsRef.current === null) {
+    try {
+      const savedKeys = JSON.parse(localStorage.getItem("trademind-trade-alert-notifications") || "[]");
+      loggedTradeAlertsRef.current = new Set(Array.isArray(savedKeys) ? savedKeys : []);
+    } catch {
+      loggedTradeAlertsRef.current = new Set();
+    }
+  }
   if (notifiedMarketSignalsRef.current === null) {
     try {
       const savedKeys = JSON.parse(localStorage.getItem("trademind-market-signal-notifications") || "[]");
@@ -395,7 +404,8 @@ function App(){
 
     const notificationKey = `${symbol}:${localDateKey}:${direction}`;
     const notificationMessage = `${symbol}: ${direction} signal on ${tradeDate}. Entry ${plan.entry}, Exit ${plan.exit}, Stop Loss ${plan.stopLoss}. Confidence ${signal.confidence || 0}%.`;
-    if (!notifiedMarketSignalsRef.current.has(notificationKey)) {
+    const isNewMarketSignalNotification = !notifiedMarketSignalsRef.current.has(notificationKey);
+    if (isNewMarketSignalNotification) {
       notifiedMarketSignalsRef.current.add(notificationKey);
       try {
         localStorage.setItem(
@@ -403,7 +413,6 @@ function App(){
           JSON.stringify([...notifiedMarketSignalsRef.current].slice(-100))
         );
       } catch {}
-      addLog(notificationMessage, "signal");
     }
 
     let signalStates = {};
@@ -501,6 +510,20 @@ function App(){
             : `${symbol} · HOLD / WAIT · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nNo active BUY signal is being tracked. No order was placed.`
           : `${symbol} · SELL signal · ${tradeDate}\nCurrent: ${formatMarketPrice(symbol, currentPrice)}\nBearish signal: consider exiting an existing long or avoiding a new long. No order was placed.`;
       telegramKey = signalStatusKey;
+    }
+
+    if (telegramMessage && telegramKey && !loggedTradeAlertsRef.current.has(telegramKey)) {
+      loggedTradeAlertsRef.current.add(telegramKey);
+      try {
+        localStorage.setItem(
+          "trademind-trade-alert-notifications",
+          JSON.stringify([...loggedTradeAlertsRef.current].slice(-100))
+        );
+      } catch {}
+      addLog(telegramMessage, "signal");
+    }
+    if (isNewMarketSignalNotification && !telegramMessage) {
+      addLog(notificationMessage, "signal");
     }
 
     if (telegramMessage && telegramConfig.botToken && telegramConfig.chatId) {
