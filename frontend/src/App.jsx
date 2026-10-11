@@ -371,7 +371,7 @@ function App(){
   useEffect(() => {
     if (!isLoggedIn || !market || !signal) return;
     const direction = String(signal.signal || "").toUpperCase();
-    if (!["BUY", "SELL"].includes(direction)) return;
+    if (!["BUY", "SELL", "HOLD"].includes(direction)) return;
 
     const plan = getSignalPlan(symbol, market, signal);
     const now = new Date();
@@ -390,6 +390,7 @@ function App(){
       addLog(message, "signal");
     }
 
+    if (!["BUY", "SELL"].includes(direction)) return;
     if (!telegramConfig.botToken || !telegramConfig.chatId) return;
     const signalKey = `${symbol}:${direction}:${signal.confidence}`;
     if (
