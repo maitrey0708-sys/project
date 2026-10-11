@@ -194,6 +194,15 @@ function App(){
   const [strategies, setStrategies] = useState(defaultStrategies);
   const lastSignalTelegramKeyRef = useRef("");
   const pendingSignalTelegramKeyRef = useRef("");
+  const notifiedMarketSignalsRef = useRef(null);
+  if (notifiedMarketSignalsRef.current === null) {
+    try {
+      const savedKeys = JSON.parse(localStorage.getItem("trademind-market-signal-notifications") || "[]");
+      notifiedMarketSignalsRef.current = new Set(Array.isArray(savedKeys) ? savedKeys : []);
+    } catch {
+      notifiedMarketSignalsRef.current = new Set();
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -361,16 +370,33 @@ function App(){
 
   useEffect(() => {
     if (!isLoggedIn || !market || !signal) return;
-    if (!telegramConfig.botToken || !telegramConfig.chatId) return;
+    const direction = String(signal.signal || "").toUpperCase();
+    if (!["BUY", "SELL"].includes(direction)) return;
+
     const plan = getSignalPlan(symbol, market, signal);
-    const signalKey = `${symbol}:${signal.signal}:${signal.confidence}`;
+    const now = new Date();
+    const tradeDate = formatTradeDate(now);
+    const localDateKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const notificationKey = `${symbol}:${localDateKey}:${direction}`;
+    const message = `${symbol}: ${direction} signal on ${tradeDate}. Entry ${plan.entry}, Exit ${plan.exit}, Stop Loss ${plan.stopLoss}. Confidence ${signal.confidence || 0}%.`;
+    if (!notifiedMarketSignalsRef.current.has(notificationKey)) {
+      notifiedMarketSignalsRef.current.add(notificationKey);
+      try {
+        localStorage.setItem(
+          "trademind-market-signal-notifications",
+          JSON.stringify([...notifiedMarketSignalsRef.current].slice(-100))
+        );
+      } catch {}
+      addLog(message, "signal");
+    }
+
+    if (!telegramConfig.botToken || !telegramConfig.chatId) return;
+    const signalKey = `${symbol}:${direction}:${signal.confidence}`;
     if (
       lastSignalTelegramKeyRef.current === signalKey ||
       pendingSignalTelegramKeyRef.current === signalKey
     ) return;
 
-    const message = `${symbol}: ${signal.signal || "WAIT"} signal on ${formatTradeDate()}. Entry ${plan.entry}, Exit ${plan.exit}, Stop Loss ${plan.stopLoss}. Confidence ${signal.confidence || 0}%.`;
-    addLog(message, "info");
     pendingSignalTelegramKeyRef.current = signalKey;
     notifyTelegram(message).then((delivery) => {
       if (delivery.ok) lastSignalTelegramKeyRef.current = signalKey;
@@ -517,7 +543,7 @@ function App(){
     notifyTelegram(`Report exported: ${title} (${scope}, ${period}).`);
   }
 
-  const notificationItems = logs.filter((entry) => entry.type === "signal" && entry.optionSignal);
+  const notificationItems = logs.filter((entry) => entry.type === "signal");
   const notificationId = (entry) => entry.id || `${entry.time}-${entry.message}`;
   const unreadNotificationCount = notificationItems.filter((entry) =>
     Number(entry.createdAt || 0) > notificationsReadAt && !readNotificationIds.has(notificationId(entry))
